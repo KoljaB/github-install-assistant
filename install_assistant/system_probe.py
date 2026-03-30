@@ -21,6 +21,8 @@ def collect_system_profile() -> SystemProfile:
             ("nvidia_query", "nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader"),
             ("nvcc_version", "nvcc --version"),
             ("cuda_path", "echo %CUDA_PATH%"),
+            ("wsl_status", "wsl.exe --status"),
+            ("wsl_list", "wsl.exe -l -v"),
         ]
         ps_specs = [
             ("os_version", "[System.Environment]::OSVersion.VersionString"),
@@ -86,6 +88,13 @@ def collect_system_profile() -> SystemProfile:
     profile.cuda_runtime_version = _extract_cuda_runtime_version(_record_output(records, "nvidia_smi"))
     profile.cuda_toolkit_version = _extract_nvcc_version(_record_output(records, "nvcc_version"))
 
+    if current_platform == "Windows":
+        wsl_status_output = _record_output(records, "wsl_status")
+        wsl_list_output = _record_output(records, "wsl_list")
+        profile.wsl_status = wsl_status_output or "Unavailable"
+        profile.wsl_distributions = _extract_wsl_distributions(wsl_list_output)
+        profile.wsl_available = bool(profile.wsl_distributions) or "default version" in wsl_status_output.lower()
+
     return profile
 
 
@@ -134,3 +143,22 @@ def _normalize_cuda_path(text: str) -> str:
     if value in {"%CUDA_PATH%", "$CUDA_PATH"}:
         return "Unknown"
     return value
+
+
+def _extract_wsl_distributions(text: str) -> list[str]:
+    distributions: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.replace("\x00", "").strip()
+        if not line or line.lower().startswith("windows subsystem"):
+            continue
+        if line.lower().startswith("the following"):
+            continue
+        if line.lower().startswith("name"):
+            continue
+        line = line.lstrip("* ").strip()
+        match = re.match(r"(?P<name>.+?)\s{2,}(?P<state>\S+)\s+(?P<version>\d+)$", line)
+        if match:
+            version = match.group("version")
+            if version == "2":
+                distributions.append(match.group("name").strip())
+    return distributions

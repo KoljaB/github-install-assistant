@@ -2,6 +2,7 @@
 
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -70,27 +71,47 @@ class InstallationOrchestrator:
 
         install_root = self._resolve_install_root(self.config.repository_url, self.config.target_dir)
         install_root.parent.mkdir(parents=True, exist_ok=True)
+        suggested_wsl_install_root = None
+        if profile.platform_family == "Windows" and profile.wsl_available:
+            suggested_wsl_install_root = self._to_wsl_mount_path(install_root)
 
         self._headline("Planning")
-        plan, response_id = self._request_plan(profile, install_root)
-        plan.install_root = str(install_root)
-        plan.first_cwd = self._normalize_cwd(plan.first_cwd, install_root)
-        plan.verification_cwd = self._normalize_cwd(plan.verification_cwd, install_root)
-        plan.venv_path = self._normalize_path_hint(plan.venv_path, install_root)
+        plan, response_id = self._request_plan(profile, install_root, suggested_wsl_install_root)
+        if plan.execution_environment not in {"native", "wsl2"}:
+            raise RuntimeError(f"Unsupported execution environment: {plan.execution_environment}")
+        if plan.execution_environment == "wsl2":
+            if profile.platform_family != "Windows":
+                raise RuntimeError("WSL2 execution was selected on a non-Windows host.")
+            if not profile.wsl_available:
+                raise RuntimeError("The planner selected WSL2 but no WSL2 distribution was detected.")
+            if not plan.wsl_distribution.strip():
+                raise RuntimeError("The planner selected WSL2 but did not provide a WSL distribution.")
+            plan.install_root = self._normalize_path_hint(
+                plan.install_root,
+                suggested_wsl_install_root or str(install_root),
+                execution_environment="wsl2",
+            )
+        else:
+            plan.install_root = str(install_root)
+            plan.wsl_distribution = ""
+        plan.first_cwd = self._normalize_cwd(plan.first_cwd, plan.install_root, plan.execution_environment)
+        plan.verification_cwd = self._normalize_cwd(plan.verification_cwd, plan.install_root, plan.execution_environment)
+        plan.venv_path = self._normalize_path_hint(plan.venv_path, plan.install_root, plan.execution_environment)
         if not plan.venv_creation_command.strip():
             raise RuntimeError("The planner did not provide a venv creation command.")
         if not plan.verification_command.strip():
             raise RuntimeError("The planner did not provide a verification command.")
         if plan.requires_torch and not plan.torch_install_command.strip():
             raise RuntimeError("The planner marked torch as required but did not provide a torch install command.")
+        host_visible_install_root = self._host_visible_path(plan.install_root) or install_root
         self._show_plan(plan)
 
         session = SessionPaths.create()
         write_json(session.status_path, {"state": "running", "message": "Installation in progress."})
-        worker_process = self._launch_worker(session)
+        worker_process = self._launch_worker(session, plan)
 
         history: list[CommandResult] = []
-        venv_ready = self._detect_virtual_environment(install_root, history) is not None
+        venv_ready = self._detect_virtual_environment(host_visible_install_root, history, plan) is not None
         torch_ready = not plan.requires_torch
         verification_has_succeeded = False
         final_state = "aborted"
@@ -102,13 +123,13 @@ class InstallationOrchestrator:
             reason=plan.first_reason,
             expectation=plan.first_expectation,
         )
-        next_task = self._enforce_prerequisites(next_task, plan, install_root, venv_ready, torch_ready)
+        next_task = self._enforce_prerequisites(next_task, plan, host_visible_install_root, venv_ready, torch_ready)
 
         try:
             for step_number in range(1, self.config.max_steps + 1):
                 result = self._dispatch_and_wait(session, worker_process, next_task)
                 history.append(result)
-                venv_ready = self._detect_virtual_environment(install_root, history) is not None
+                venv_ready = self._detect_virtual_environment(host_visible_install_root, history, plan) is not None
                 torch_ready = torch_ready or self._is_torch_step(result, plan)
                 verification_has_succeeded = verification_has_succeeded or self._matches_verification(result, plan)
                 self._show_command_result(result)
@@ -142,11 +163,11 @@ class InstallationOrchestrator:
                         next_task = CommandTask(
                             step_number=step_number + 1,
                             command=plan.torch_install_command,
-                            cwd=self._torch_command_cwd(plan, install_root),
+                            cwd=self._torch_command_cwd(plan, host_visible_install_root),
                             reason="Install the researched torch build before finishing.",
                             expectation="Torch should be installed successfully inside the venv.",
                         )
-                        next_task = self._enforce_prerequisites(next_task, plan, install_root, venv_ready, torch_ready)
+                        next_task = self._enforce_prerequisites(next_task, plan, host_visible_install_root, venv_ready, torch_ready)
                         continue
                     if verification_has_succeeded:
                         final_state = "completed"
@@ -159,7 +180,7 @@ class InstallationOrchestrator:
                         reason="Explicit verification is required before the installer can finish.",
                         expectation="The verification command should succeed if the installation is complete.",
                     )
-                    next_task = self._enforce_prerequisites(next_task, plan, install_root, venv_ready, torch_ready)
+                    next_task = self._enforce_prerequisites(next_task, plan, host_visible_install_root, venv_ready, torch_ready)
                     continue
 
                 next_command = action.next_command.strip()
@@ -168,7 +189,7 @@ class InstallationOrchestrator:
                     final_message = "The LLM returned continue without a next command."
                     break
 
-                normalized_cwd = self._normalize_cwd(action.cwd, install_root)
+                normalized_cwd = self._normalize_cwd(action.cwd, plan.install_root, plan.execution_environment)
                 if self._is_repeated_command(history, next_command, normalized_cwd):
                     final_state = "aborted"
                     final_message = (
@@ -183,7 +204,7 @@ class InstallationOrchestrator:
                     reason=action.reason,
                     expectation=action.expectation,
                 )
-                next_task = self._enforce_prerequisites(next_task, plan, install_root, venv_ready, torch_ready)
+                next_task = self._enforce_prerequisites(next_task, plan, host_visible_install_root, venv_ready, torch_ready)
         finally:
             write_json(session.status_path, {"state": final_state, "message": final_message})
 
@@ -191,7 +212,8 @@ class InstallationOrchestrator:
         self._detail(f"Final state: {final_state}")
         self._detail(f"Reason: {final_message}")
         self._show_final_documentation(
-            install_root=install_root,
+            install_root=host_visible_install_root,
+            execution_root=plan.install_root,
             plan=plan,
             history=history,
             final_state=final_state,
@@ -204,12 +226,18 @@ class InstallationOrchestrator:
         shutil.rmtree(session.root, ignore_errors=True)
         return 0 if final_state == "completed" else 1
 
-    def _request_plan(self, profile: SystemProfile, install_root: Path) -> tuple[InstallPlan, str]:
+    def _request_plan(
+        self,
+        profile: SystemProfile,
+        install_root: Path,
+        suggested_wsl_install_root: str | None,
+    ) -> tuple[InstallPlan, str]:
         prompt = planner_prompt(
             repository_url=self.config.repository_url,
             install_goal=self.config.install_goal,
             install_root=install_root,
             system_profile=profile,
+            suggested_wsl_install_root=suggested_wsl_install_root,
         )
         self._llm_prompt("planner", prompt)
         response = self.client.create_json_response(
@@ -311,6 +339,10 @@ class InstallationOrchestrator:
         if plan.source_urls:
             for url in plan.source_urls:
                 self._detail(f"source: {url}")
+        self._detail(f"execution environment: {plan.execution_environment}")
+        if plan.execution_environment == "wsl2":
+            self._detail(f"WSL distribution: {plan.wsl_distribution}")
+        self._detail(f"install root: {plan.install_root}")
         self._detail(f"venv path: {plan.venv_path}")
         self._detail(f"venv creation command: {plan.venv_creation_command}")
         self._detail(f"torch required: {'yes' if plan.requires_torch else 'no'}")
@@ -343,6 +375,7 @@ class InstallationOrchestrator:
         self,
         *,
         install_root: Path,
+        execution_root: str,
         plan: InstallPlan,
         history: list[CommandResult],
         final_state: str,
@@ -353,7 +386,11 @@ class InstallationOrchestrator:
         self._headline("Final Documentation")
         self._detail(f"Repository URL: {self.config.repository_url}")
         self._detail(f"Install goal: {self.config.install_goal}")
-        self._detail(f"Installation root: {install_root}")
+        self._detail(f"Execution environment: {plan.execution_environment}")
+        if plan.execution_environment == "wsl2":
+            self._detail(f"WSL distribution: {plan.wsl_distribution}")
+        self._detail(f"Execution root: {execution_root}")
+        self._detail(f"Host-visible installation root: {install_root}")
         self._detail(f"Verification succeeded: {'yes' if verification_has_succeeded else 'no'}")
         self._detail(f"Verification command: {plan.verification_command}")
         self._detail(f"Torch required: {'yes' if plan.requires_torch else 'no'}")
@@ -382,15 +419,19 @@ class InstallationOrchestrator:
                 self._detail(f"Working directory: {item.cwd}")
                 self._command(item.command + "\n")
 
-        venv_path = self._detect_virtual_environment(install_root, history)
+        venv_path = self._detect_virtual_environment(install_root, history, plan)
         self._headline("2. Virtual Environment")
         if venv_path:
             self._success(f"Virtual environment folder: {venv_path}")
-            for activate_label, activate_command in self._activation_commands(venv_path):
+            if plan.execution_environment == "wsl2":
+                self._detail(f"WSL virtual environment path: {plan.venv_path}")
+                self._detail("Open the WSL shell first:")
+                self._command(f'wsl -d "{plan.wsl_distribution}"\n')
+            for activate_label, activate_command in self._activation_commands(plan, venv_path):
                 self._detail(f"{activate_label}:")
                 self._command(activate_command + "\n")
             self._detail("Direct Python inside the environment:")
-            self._command(f'"{self._venv_python_path(venv_path)}"\n')
+            self._command(f'"{self._venv_python_path(plan, venv_path)}"\n')
         else:
             self._warning(
                 "No virtual environment folder was found in the installation root or command history. "
@@ -428,7 +469,7 @@ class InstallationOrchestrator:
             for script_name in repo_info["pyproject_scripts"]:
                 self._output(f"- {script_name}\n")
 
-        suggested_python = str(self._venv_python_path(venv_path)) if venv_path else "python"
+        suggested_python = self._venv_python_path(plan, venv_path) if venv_path else "python"
         if repo_info["has_pytest"]:
             self._detail("Likely first test command:")
             self._command(f'"{suggested_python}" -m pytest\n' if venv_path else "python -m pytest\n")
@@ -438,7 +479,13 @@ class InstallationOrchestrator:
         elif repo_info["example_files"]:
             self._detail("A practical first run candidate from the repository:")
             candidate = repo_info["example_files"][0]
-            if venv_path:
+            if plan.execution_environment == "wsl2":
+                execution_candidate = posixpath.join(execution_root, candidate.replace("\\", "/"))
+                if venv_path:
+                    self._command(f'"{suggested_python}" "{execution_candidate}"\n')
+                else:
+                    self._command(f'python "{execution_candidate}"\n')
+            elif venv_path:
                 self._command(f'"{suggested_python}" "{install_root / candidate}"\n')
             else:
                 self._command(f'python "{install_root / candidate}"\n')
@@ -459,18 +506,34 @@ class InstallationOrchestrator:
             for path in repo_info["entrypoint_files"]:
                 self._output(f"- {path}\n")
 
-    def _detect_virtual_environment(self, install_root: Path, history: list[CommandResult]) -> Path | None:
+    def _detect_virtual_environment(
+        self,
+        install_root: Path,
+        history: list[CommandResult],
+        plan: InstallPlan,
+    ) -> Path | None:
         candidates: list[Path] = []
         for item in history:
             match = re.search(r"-m\s+venv\s+([\"']?)([^\"'\s]+)\1", item.command)
             if match:
-                raw_path = Path(match.group(2))
-                candidate = raw_path if raw_path.is_absolute() else Path(item.cwd) / raw_path
-                candidates.append(candidate)
+                raw_path = match.group(2)
+                if plan.execution_environment == "wsl2":
+                    candidate = self._host_visible_path(raw_path)
+                else:
+                    path = Path(raw_path)
+                    candidate = path if path.is_absolute() else Path(item.cwd) / path
+                if candidate is not None:
+                    candidates.append(candidate)
             for found in re.findall(r"([A-Za-z]:\\[^\"']+?\\Scripts\\python\.exe)", item.command):
                 candidates.append(Path(found).parent.parent)
             for found in re.findall(r"(/[^\"'\s]+/(?:bin|Scripts)/python(?:\.exe)?)", item.command):
-                candidates.append(Path(found).parent.parent)
+                candidate = self._host_visible_path(found)
+                if candidate is not None:
+                    candidates.append(candidate.parent.parent if candidate.name.startswith("python") else candidate)
+
+        mapped_venv = self._host_visible_path(plan.venv_path)
+        if mapped_venv is not None:
+            candidates.append(mapped_venv)
 
         for name in (".venv", "venv", "env", ".env"):
             candidates.append(install_root / name)
@@ -572,13 +635,15 @@ class InstallationOrchestrator:
                 keywords.append(token)
         return keywords
 
-    def _launch_worker(self, session: SessionPaths) -> subprocess.Popen[bytes]:
+    def _launch_worker(self, session: SessionPaths, plan: InstallPlan) -> subprocess.Popen[bytes]:
         config_payload = {
             "commands_dir": str(session.commands_dir),
             "results_dir": str(session.results_dir),
             "artifacts_dir": str(session.artifacts_dir),
             "events_path": str(session.events_path),
             "status_path": str(session.status_path),
+            "execution_environment": plan.execution_environment,
+            "wsl_distribution": plan.wsl_distribution,
         }
         write_json(session.config_path, config_payload)
 
@@ -624,22 +689,36 @@ class InstallationOrchestrator:
                 continue
         raise RuntimeError("No supported terminal launcher was found for this platform.")
 
-    def _normalize_cwd(self, value: str, install_root: Path) -> str:
+    def _normalize_cwd(self, value: str, install_root: str | Path, execution_environment: str) -> str:
         text = (value or "").strip()
+        base = str(install_root)
+        if execution_environment == "wsl2":
+            if not text:
+                return posixpath.normpath(base)
+            if text.startswith("/"):
+                return posixpath.normpath(text)
+            return posixpath.normpath(posixpath.join(base, text))
         if not text:
             return str(install_root)
         path = Path(text)
         if not path.is_absolute():
-            path = install_root / path
+            path = Path(base) / path
         return str(path)
 
-    def _normalize_path_hint(self, value: str, install_root: Path) -> str:
+    def _normalize_path_hint(self, value: str, install_root: str | Path, execution_environment: str) -> str:
         text = (value or "").strip()
+        base = str(install_root)
+        if execution_environment == "wsl2":
+            if not text:
+                return posixpath.normpath(posixpath.join(base, ".venv"))
+            if text.startswith("/"):
+                return posixpath.normpath(text)
+            return posixpath.normpath(posixpath.join(base, text))
         if not text:
-            return str(install_root / ".venv")
+            return str(Path(base) / ".venv")
         path = Path(text)
         if not path.is_absolute():
-            path = install_root / path
+            path = Path(base) / path
         return str(path)
 
     def _matches_verification(self, result: CommandResult, plan: InstallPlan) -> bool:
@@ -647,14 +726,11 @@ class InstallationOrchestrator:
         expected_commands.add(
             self._rewrite_command_for_venv(
                 plan.verification_command,
-                self._venv_python_path(Path(plan.venv_path)),
+                self._venv_python_path(plan, plan.venv_path),
             ).strip()
         )
-        return (
-            result.command.strip() in expected_commands
-            and Path(result.cwd) == Path(plan.verification_cwd)
-            and result.exit_code == 0
-        )
+        expected_cwd = self._normalize_cwd(plan.verification_cwd, plan.install_root, plan.execution_environment)
+        return result.command.strip() in expected_commands and result.cwd == expected_cwd and result.exit_code == 0
 
     def _is_torch_step(self, result: CommandResult, plan: InstallPlan) -> bool:
         if result.exit_code != 0:
@@ -709,7 +785,7 @@ class InstallationOrchestrator:
                     step_number=task.step_number,
                     command=self._rewrite_command_for_venv(
                         plan.torch_install_command,
-                        self._venv_python_path(Path(plan.venv_path)),
+                        self._venv_python_path(plan, plan.venv_path),
                     ),
                     cwd=self._torch_command_cwd(plan, install_root),
                     reason="Install the researched torch build before other dependencies.",
@@ -722,7 +798,7 @@ class InstallationOrchestrator:
     def _rewrite_task_for_venv(self, task: CommandTask, plan: InstallPlan) -> CommandTask:
         if task.command.strip() == plan.venv_creation_command.strip():
             return task
-        rewritten = self._rewrite_command_for_venv(task.command, self._venv_python_path(Path(plan.venv_path)))
+        rewritten = self._rewrite_command_for_venv(task.command, self._venv_python_path(plan, plan.venv_path))
         if rewritten == task.command:
             return task
         return CommandTask(
@@ -733,7 +809,7 @@ class InstallationOrchestrator:
             expectation=task.expectation,
         )
 
-    def _rewrite_command_for_venv(self, command: str, venv_python: Path) -> str:
+    def _rewrite_command_for_venv(self, command: str, venv_python: str) -> str:
         stripped = command.strip()
         lowered = stripped.lower()
         venv_python_text = f'"{venv_python}"'
@@ -758,10 +834,14 @@ class InstallationOrchestrator:
         return command
 
     def _venv_command_cwd(self, plan: InstallPlan, install_root: Path) -> str:
+        if plan.execution_environment == "wsl2":
+            return posixpath.dirname(plan.venv_path) or plan.install_root
         venv_path = Path(plan.venv_path)
         return str(venv_path.parent if venv_path.parent != Path('.') else install_root)
 
     def _torch_command_cwd(self, plan: InstallPlan, install_root: Path) -> str:
+        if plan.execution_environment == "wsl2":
+            return posixpath.dirname(plan.venv_path) or plan.install_root
         venv_path = Path(plan.venv_path)
         return str(venv_path.parent if venv_path.parent != Path('.') else install_root)
 
@@ -782,12 +862,16 @@ class InstallationOrchestrator:
             repository_name = repository_name[:-4]
         return (Path.cwd() / "installed_repositories" / repository_name).resolve()
 
-    def _venv_python_path(self, venv_path: Path) -> Path:
-        if os.name == "nt":
-            return venv_path / "Scripts" / "python.exe"
-        return venv_path / "bin" / "python"
+    def _venv_python_path(self, plan: InstallPlan, venv_path: str | Path) -> str:
+        text = plan.venv_path if plan.execution_environment == "wsl2" else str(venv_path)
+        if plan.execution_environment == "wsl2" or os.name != "nt":
+            return posixpath.join(text, "bin", "python")
+        return str(Path(text) / "Scripts" / "python.exe")
 
-    def _activation_commands(self, venv_path: Path) -> list[tuple[str, str]]:
+    def _activation_commands(self, plan: InstallPlan, venv_path: Path) -> list[tuple[str, str]]:
+        text = plan.venv_path if plan.execution_environment == "wsl2" else str(venv_path)
+        if plan.execution_environment == "wsl2":
+            return [("WSL shell activation command", f'source "{text}/bin/activate"')]
         if os.name == "nt":
             return [
                 ("PowerShell activation command", f'& "{venv_path / "Scripts" / "Activate.ps1"}"'),
@@ -801,6 +885,30 @@ class InstallationOrchestrator:
             or (path / "bin" / "python").exists()
             or (path / "pyvenv.cfg").exists()
         )
+
+    def _host_visible_path(self, raw_path: str) -> Path | None:
+        text = (raw_path or "").strip()
+        if not text:
+            return None
+        wsl_match = re.match(r"^/mnt/([a-zA-Z])/(.*)$", text)
+        if wsl_match:
+            drive = wsl_match.group(1).upper()
+            tail = wsl_match.group(2).replace("/", "\\")
+            return Path(f"{drive}:\\{tail}")
+        try:
+            path = Path(text)
+        except Exception:
+            return None
+        if path.is_absolute() or path.drive:
+            return path
+        return None
+
+    def _to_wsl_mount_path(self, path: Path) -> str | None:
+        if os.name != "nt" or not path.drive:
+            return None
+        drive = path.drive.rstrip(":").lower()
+        posix_tail = path.as_posix().split(":", 1)[-1]
+        return f"/mnt/{drive}{posix_tail}"
 
     def _llm_prompt(self, label: str, content: str) -> None:
         self._headline(f"LLM Prompt: {label}")
@@ -847,6 +955,17 @@ class InstallationOrchestrator:
     def _response(self, text: str) -> None:
         sys.stdout.write(paint(text, PARENT_THEME.response))
         sys.stdout.flush()
+
+
+
+
+
+
+
+
+
+
+
 
 
 

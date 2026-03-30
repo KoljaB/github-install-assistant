@@ -35,6 +35,9 @@ class SystemProfile:
     cuda_toolkit_version: str = "Unknown"
     cuda_path: str = "Unknown"
     processor_count: str = "Unknown"
+    wsl_available: bool = False
+    wsl_status: str = "Unknown"
+    wsl_distributions: list[str] = field(default_factory=list)
     records: list[ProbeRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -53,6 +56,9 @@ class SystemProfile:
             "cuda_toolkit_version": self.cuda_toolkit_version,
             "cuda_path": self.cuda_path,
             "processor_count": self.processor_count,
+            "wsl_available": self.wsl_available,
+            "wsl_status": self.wsl_status,
+            "wsl_distributions": list(self.wsl_distributions),
             "records": [record.to_dict() for record in self.records],
         }
 
@@ -73,6 +79,9 @@ class SystemProfile:
             f"CUDA toolkit version: {self.cuda_toolkit_version}",
             f"CUDA_PATH: {self.cuda_path}",
             f"Logical processor count: {self.processor_count}",
+            f"WSL available: {'yes' if self.wsl_available else 'no'}",
+            f"WSL status: {self.wsl_status}",
+            f"WSL distributions: {', '.join(self.wsl_distributions) if self.wsl_distributions else 'None detected'}",
         ]
         return "\n".join(lines)
 
@@ -93,6 +102,17 @@ class SystemProfile:
                 "",
                 "CUDA_PATH probe output:",
                 self.probe_output("cuda_path"),
+            ]
+        )
+
+    def wsl_probe_block(self) -> str:
+        return "\n".join(
+            [
+                "wsl --status output:",
+                self.probe_output("wsl_status"),
+                "",
+                "wsl -l -v output:",
+                self.probe_output("wsl_list"),
             ]
         )
 
@@ -135,6 +155,8 @@ class CommandResult:
 @dataclass
 class InstallPlan:
     research_summary: str
+    execution_environment: str
+    wsl_distribution: str
     install_root: str
     venv_path: str
     venv_creation_command: str

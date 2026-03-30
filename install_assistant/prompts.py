@@ -23,7 +23,27 @@ def planner_prompt(
     install_goal: str,
     install_root: Path,
     system_profile: SystemProfile,
+    suggested_wsl_install_root: str | None,
 ) -> str:
+    wsl_block = ""
+    if system_profile.platform_family == "Windows":
+        wsl_lines = [
+            "WSL2 probe outputs:",
+            system_profile.wsl_probe_block(),
+            "",
+            "WSL guidance:",
+            "- On Windows, you may choose `execution_environment = \"wsl2\"` when the repository is Linux-first, shell-script heavy, depends on apt/system packages, or is substantially more reliable inside Linux.",
+            "- If you choose WSL2, pick one of the detected WSL2 distributions and return it in `wsl_distribution`.",
+        ]
+        if suggested_wsl_install_root:
+            wsl_lines.append(
+                f"- If you choose WSL2, prefer installing into this mirrored WSL path so the Windows host can still inspect the repository afterwards: {suggested_wsl_install_root}"
+            )
+        wsl_lines.append(
+            "- If you do not need WSL2, set `execution_environment = \"native\"` and leave `wsl_distribution` empty."
+        )
+        wsl_block = "\n".join(wsl_lines)
+
     return f"""
 You are planning how to install a GitHub repository on the detected machine.
 
@@ -33,7 +53,7 @@ Repository URL:
 Install goal:
 {install_goal}
 
-Target installation directory:
+Host-visible target installation directory:
 {install_root}
 
 Detected system profile:
@@ -42,13 +62,17 @@ Detected system profile:
 Important CUDA and Torch probe outputs:
 {system_profile.torch_probe_block()}
 
+{wsl_block}
+
 Rules:
 - Research the repository using web search before deciding the plan.
-- The plan must be platform-aware. 
+- The plan must be platform-aware.
+- Return `execution_environment` as either `native` or `wsl2`.
 - A dedicated virtual environment is mandatory. Return both `venv_path` and `venv_creation_command`.
 - Assume every shell command will run independently with an explicit working directory.
 - Do not rely on shell state, do not use `cd`, and do not rely on activation side effects.
 - Use explicit interpreter paths from the venv after it exists.
+- If `execution_environment` is `wsl2`, return Linux shell commands and Linux paths for `install_root`, `venv_path`, `first_cwd`, and `verification_cwd`.
 - If the user goal implies an optional acceleration feature or model backend, expand the goal into the concrete install objective that would actually satisfy it.
 - Decide whether the repository or the install goal requires torch.
 - {TORCH_HINT}
@@ -70,6 +94,8 @@ def planner_schema() -> dict:
             "additionalProperties": False,
             "properties": {
                 "research_summary": {"type": "string"},
+                "execution_environment": {"type": "string", "enum": ["native", "wsl2"]},
+                "wsl_distribution": {"type": "string"},
                 "install_root": {"type": "string"},
                 "venv_path": {"type": "string"},
                 "venv_creation_command": {"type": "string"},
@@ -89,6 +115,8 @@ def planner_schema() -> dict:
             },
             "required": [
                 "research_summary",
+                "execution_environment",
+                "wsl_distribution",
                 "install_root",
                 "venv_path",
                 "venv_creation_command",
@@ -126,6 +154,9 @@ def action_prompt(
 ) -> str:
     history_block = _history_block(history)
     last_result_block = _result_block(last_result)
+    environment_line = f"Execution environment: {plan.execution_environment}"
+    if plan.execution_environment == "wsl2":
+        environment_line += f"\nWSL distribution: {plan.wsl_distribution}"
     return f"""
 You are driving a platform-aware installation assistant for a GitHub repository.
 
@@ -134,6 +165,8 @@ Repository URL:
 
 Install goal:
 {install_goal}
+
+{environment_line}
 
 Installation root:
 {plan.install_root}
@@ -187,6 +220,7 @@ Control rules:
 - {TORCH_HINT}
 - If the goal mentions an optional model, acceleration backend, or integration, choose next commands that move toward that fully expanded goal rather than a bare minimum install.
 - If a torch, CUDA, cuDNN, or wheel compatibility problem appears in the output, use web research mentally and choose the most compatible supported build, not automatically the newest one.
+- If `execution_environment` is `wsl2`, return Linux shell commands and Linux paths only. Do not prefix commands with `wsl.exe`; the runtime handles that.
 - If the installation appears complete, only return `finish` after a successful verification command or a clearly satisfied success signal.
 - If continuing is unsafe or clearly impossible, return `abort`.
 - Keep the total session within {max_steps} commands. This is step {step_number} of {max_steps}.
